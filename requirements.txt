@@ -1,0 +1,5 @@
+ultralytics==8.3.30
+opencv-python>=4.8
+python-dotenv>=1.0
+requests>=2.32
+google-genai>=0.3.0
