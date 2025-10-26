@@ -43,6 +43,7 @@ class Config:
     use_vertex: bool = field(init=False)
 
     telegram_token: str = field(init=False)
+    telegram_chat: str = field(init=False)
     telegram_chat_id: str = field(init=False)
     send_video: bool = field(init=False)
     max_telegram_mb: int = field(init=False)
@@ -85,8 +86,8 @@ class Config:
         self.use_vertex = os.getenv("USE_VERTEX", "False").lower() == "true"
 
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        # với nhóm private: TELEGRAM_CHAT_ID là số âm -100...
-        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+        self.telegram_chat = os.getenv("TELEGRAM_CHAT") or os.getenv("TELEGRAM_CHAT_ID", "")
+
         self.send_video = os.getenv("SEND_VIDEO", "yes").lower() == "yes"
         self.max_telegram_mb = int(os.getenv("MAX_TELEGRAM_MB", "49"))
 
@@ -100,4 +101,4 @@ class Config:
     def validate(self):
         assert self.rtsp_url, "RTSP_URL is required"
         assert self.gemini_api_key, "GEMINI_API_KEY is required"
-        assert self.telegram_token and self.telegram_chat_id, "Telegram token/chat id are required"
+        assert self.telegram_token and self.telegram_chat, "Telegram token/chat are required"
