@@ -36,7 +36,8 @@ def run():
         device_pref=cfg.device_pref, use_fp16=cfg.use_fp16
     )
 
-    tele = TelegramClient(cfg.telegram_token, cfg.telegram_chat_id, max_mb=cfg.max_telegram_mb)
+    tele = TelegramClient(cfg.telegram_token, cfg.telegram_chat, max_mb=cfg.max_telegram_mb)
+
     gem = GeminiClient(cfg.gemini_api_key, cfg.gemini_model, use_vertex=cfg.use_vertex)
 
     merger = EventMerger(merge_window=cfg.merge_window_seconds, cooldown=cfg.cooldown_seconds)

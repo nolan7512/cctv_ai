@@ -47,7 +47,7 @@ class Config:
     use_vertex: bool = os.getenv("USE_VERTEX", "False").lower() == "true"
 
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    telegram_chat: str = os.getenv("TELEGRAM_CHAT") or os.getenv("TELEGRAM_CHAT_ID", "")
     send_video: bool = os.getenv("SEND_VIDEO", "yes").lower() == "yes"
     max_telegram_mb: int = int(os.getenv("MAX_TELEGRAM_MB", 49))
 
@@ -58,8 +58,8 @@ class Config:
     use_fp16: bool = os.getenv("USE_FP16", "yes").lower() == "yes"
 
     name: str = os.getenv("NAME", "cam")
-
+    
     def validate(self):
         assert self.rtsp_url, "RTSP_URL is required"
         assert self.gemini_api_key, "GEMINI_API_KEY is required"
-        assert self.telegram_token and self.telegram_chat_id, "Telegram token/chat id are required"
+        assert self.telegram_token and self.telegram_chat, "Telegram token/chat are required"
