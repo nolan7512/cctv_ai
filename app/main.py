@@ -47,7 +47,7 @@ def run():
     chat_param = getattr(cfg, "telegram_chat", None) or getattr(cfg, "telegram_chat_id", None)
     tele = TelegramClient(cfg.telegram_token, chat_param, max_mb=cfg.max_telegram_mb)
 
-    # Gemini
+    # Gemini (trả về 1 đoạn Summary tiếng Việt)
     gem = GeminiClient(cfg.gemini_api_key, cfg.gemini_model, use_vertex=cfg.use_vertex)
 
     # Gom sự kiện
@@ -63,7 +63,7 @@ def run():
     # Thông báo start
     try:
         tele.send_text(
-            f"✅ [{cfg.name}] started. Watching AI stream; ring-buffer active. "
+            f"✅ [{cfg.name}] đã chạy. Đang tiền hành giám sát"
             f"Device={getattr(detector,'device','cpu')} FP16={getattr(detector,'use_fp16',False)}"
         )
     except Exception as e:
@@ -123,51 +123,12 @@ def run():
                     pass
                 clip_lite = clip_full
 
-            # Gọi Gemini tóm tắt
+            # Gọi Gemini: chỉ lấy Summary
             try:
-                # Tạo hints dựa trên event gộp
-                event_counts = {ev.cls: ev.count}   # ví dụ: {"person": 3}
-                hints = {
-                    "focus": [ev.cls],              # ưu tiên mô tả đúng class kích hoạt
-                    "counts": event_counts,         # số lượng sơ bộ trong cửa sổ sự kiện
-                    "want": list(cfg.objects_of_interest)  # các lớp bạn quan tâm trong .env
-                }
-                
-                # Gemini analysis (mới)
-                result = gem.analyze_video(clip_lite, hints=hints)
-                summary = result.get("summary") or "(no summary)"
-                objects = ", ".join(result.get("objects", []))
-                incident = result.get("incident", "")
-
-                # (tuỳ chọn) rút thêm thông tin từ JSON giàu chi tiết
-                persons = result.get("persons") or {}
-                vehicles = result.get("vehicles") or []
-                animals = result.get("animals") or []
-
-                extra_lines = []
-                if persons:
-                    c = persons.get("count")
-                    acts = persons.get("actions") or []
-                    riding = persons.get("riding") or []
-                    if c is not None:
-                        extra_lines.append(f"• Persons: {c} (acts: {', '.join(acts)[:80] or 'n/a'}; riding: {', '.join(riding) or 'no'})")
-                if vehicles:
-                    vlist = [f"{v.get('type','?')} x{v.get('count','?')} ({v.get('state','?')})" for v in vehicles[:4]]
-                    if vlist:
-                        extra_lines.append("• Vehicles: " + "; ".join(vlist))
-                if animals:
-                    alist = [f"{a.get('species','?')} x{a.get('count','?')}" for a in animals[:4]]
-                    if alist:
-                        extra_lines.append("• Animals: " + "; ".join(alist))
-
-                txt = (
-                    f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"• Objects: {objects}\n"
-                    f"• Incident: {incident}\n"
-                    f"• Summary: {summary}\n" +
-                    ("\n".join(extra_lines) if extra_lines else "")
-                )
+                summary = gem.analyze_video(clip_lite)  # trả về chuỗi tiếng Việt 1–3 câu
+                txt = f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}"
                 tele.send_text(txt)
+                logger.info(f"[{cfg.name}] Gemini summary sent")
             except Exception as e:
                 logger.exception(f"[{cfg.name}] Gemini failed")
                 try:
