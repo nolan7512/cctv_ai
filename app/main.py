@@ -1,6 +1,7 @@
 # app/main.py
 import argparse, time, os
 from pathlib import Path
+from collections import defaultdict, deque
 
 from app.config import load_env, Config
 from app.ringbuffer import FFmpegRingBuffer
@@ -53,7 +54,7 @@ def run():
     chat_param = getattr(cfg, "telegram_chat", None) or getattr(cfg, "telegram_chat_id", None)
     tele = TelegramClient(cfg.telegram_token, chat_param, max_mb=cfg.max_telegram_mb)
 
-    # Gemini (trả về 1 đoạn Summary tiếng Việt)
+    # Gemini (trả về 1 đoạn Summary tiếng Việt; có thể trả "NO_ACTIVITY")
     gem = GeminiClient(cfg.gemini_api_key, cfg.gemini_model, use_vertex=cfg.use_vertex)
 
     # Gom sự kiện
@@ -69,7 +70,7 @@ def run():
     # Thông báo start
     try:
         tele.send_text(
-            f"✅ [{cfg.name}] đã chạy, đang tiến hành giám sát"
+            f"✅ [{cfg.name}] started. Đang chạy giám sát "
             f"Device={getattr(detector,'device','cpu')} FP16={getattr(detector,'use_fp16',False)}"
         )
     except Exception as e:
@@ -77,30 +78,42 @@ def run():
 
     LOG_DETECTION = os.getenv("LOG_DETECTION", "no").lower() == "yes"
 
-    # === Housekeeping cấu hình (mặc định theo yêu cầu: 1 giờ, giữ clip 3 ngày) ===
+    # === Housekeeping cấu hình (mặc định: 1 giờ, giữ clip 3 ngày) ===
     last_hk = 0.0
     HK_INTERVAL_SEC      = int(os.getenv("HK_INTERVAL_SEC", "3600"))  # 1 giờ
     BUFFER_MAX_FILES     = int(os.getenv("BUFFER_MAX_FILES", str(cfg.wrap_segments)))
     CLIPS_RETENTION_DAYS = int(os.getenv("CLIPS_RETENTION_DAYS", "3"))  # 3 ngày
-    # Đặt CLIPS_MAX_GB>0 để bật ép dung lượng tổng, 0 hoặc âm = tắt
-    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))
+    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))  # >0 để bật ép dung lượng
+
+    # === Debounce/confirm & chặn event quá ngắn ===
+    CONFIRM_FRAMES   = int(os.getenv("CONFIRM_FRAMES", "3"))
+    CONFIRM_WINDOW   = float(os.getenv("CONFIRM_WINDOW", "0.8"))   # giây
+    MIN_EVENT_SECONDS = float(os.getenv("MIN_EVENT_SECONDS", "1.0"))
+    _recent = defaultdict(lambda: deque())  # class -> deque các timestamp gần nhất
+
+    # === Blackout sau sự kiện & bỏ qua NO_ACTIVITY ===
+    SKIP_NO_ACTIVITY = os.getenv("SKIP_NO_ACTIVITY", "yes").lower() == "yes"
+    POST_EVENT_SILENCE_SEC = float(os.getenv("POST_EVENT_SILENCE_SEC", "8"))
+    next_armed_ts = 0.0  # thời điểm sớm nhất cho phép nhận event kế tiếp
 
     try:
         for det in detector.stream_detect(src_ai, motion_gate=motion):
-            # Housekeeping theo chu kỳ
             now = time.time()
+
+            # Blackout: nếu đang trong thời gian "im lặng" sau event trước đó, bỏ qua detect
+            if now < next_armed_ts:
+                continue
+
+            # Housekeeping theo chu kỳ
             if now - last_hk >= HK_INTERVAL_SEC:
-                # buffer/: giới hạn theo số file
                 total, removed = purge_oldest_by_count(cfg.buffer_dir, keep=BUFFER_MAX_FILES)
                 if removed:
                     logger.info(f"[{cfg.name}] HK buffer: kept {BUFFER_MAX_FILES}/{total}, removed={removed}")
 
-                # clips/: xóa clip cũ theo ngày
                 rem_old = purge_older_than(cfg.clip_dir, days=CLIPS_RETENTION_DAYS)
                 if rem_old:
                     logger.info(f"[{cfg.name}] HK clips: removed {rem_old} old files (> {CLIPS_RETENTION_DAYS}d)")
 
-                # clips/: ép tổng dung lượng (nếu bật)
                 if CLIPS_MAX_GB > 0:
                     size_gb, rem_sz = purge_until_size(cfg.clip_dir, max_gb=CLIPS_MAX_GB)
                     if rem_sz:
@@ -117,6 +130,14 @@ def run():
             ts = det["ts"]
             cls = det["class"]
 
+            # Debounce/confirm: chỉ cho qua khi cùng class xuất hiện đủ nhiều trong cửa sổ ngắn
+            dq = _recent[cls]
+            dq.append(ts)
+            while dq and ts - dq[0] > CONFIRM_WINDOW:
+                dq.popleft()
+            if len(dq) < CONFIRM_FRAMES:
+                continue
+
             # Gom event
             emitted = merger.push(cls, ts)
             if emitted is None:
@@ -127,6 +148,16 @@ def run():
             t_first, t_last, ev = emitted
             dur = max(0.0, t_last - t_first)
             logger.info(f"[{cfg.name}] EVENT {ev.cls} x{ev.count} window={dur:.1f}s")
+
+            # Bỏ qua event quá ngắn (thường là nhiễu/chớp)
+            if dur < MIN_EVENT_SECONDS:
+                logger.info(f"[{cfg.name}] skip short event (<{MIN_EVENT_SECONDS}s)")
+                # vẫn đặt blackout ngắn để triệt vòng lặp cùng frame
+                next_armed_ts = time.time() + min(POST_EVENT_SILENCE_SEC, 2.0)
+                continue
+
+            # Đặt blackout ngay khi chấp nhận event
+            next_armed_ts = time.time() + POST_EVENT_SILENCE_SEC
 
             # Cửa sổ clip trên MAIN
             t0 = max(0.0, t_first - cfg.pre_roll)
@@ -158,9 +189,13 @@ def run():
                     pass
                 clip_lite = clip_full
 
-            # Gọi Gemini: chỉ lấy Summary
+            # Gọi Gemini: chỉ lấy Summary hành động; bỏ qua nếu NO_ACTIVITY
             try:
-                summary = gem.analyze_video(clip_lite)  # trả về chuỗi tiếng Việt 1–3 câu
+                summary = gem.analyze_video(clip_lite)  # chuỗi tiếng Việt hoặc "NO_ACTIVITY"
+                if SKIP_NO_ACTIVITY and summary.strip().upper() == "NO_ACTIVITY":
+                    logger.info(f"[{cfg.name}] Gemini: NO_ACTIVITY → skip notify")
+                    continue
+
                 txt = f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}"
                 tele.send_text(txt)
                 logger.info(f"[{cfg.name}] Gemini summary sent")
