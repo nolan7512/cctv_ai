@@ -1,3 +1,4 @@
+# app/main.py
 import argparse, time, os
 from pathlib import Path
 
@@ -10,6 +11,11 @@ from app.clipper import make_gemini_lite
 from app.gemini_client import GeminiClient
 from app.telegram_client import TelegramClient
 from app.logger import get_logger
+from app.housekeeping import (
+    purge_oldest_by_count,
+    purge_older_than,
+    purge_until_size,
+)
 
 
 def run():
@@ -63,7 +69,7 @@ def run():
     # Thông báo start
     try:
         tele.send_text(
-            f"✅ [{cfg.name}] đã chạy. Đang tiền hành giám sát"
+            f"✅ [{cfg.name}] đã chạy, đang tiến hành giám sát"
             f"Device={getattr(detector,'device','cpu')} FP16={getattr(detector,'use_fp16',False)}"
         )
     except Exception as e:
@@ -71,8 +77,37 @@ def run():
 
     LOG_DETECTION = os.getenv("LOG_DETECTION", "no").lower() == "yes"
 
+    # === Housekeeping cấu hình (mặc định theo yêu cầu: 1 giờ, giữ clip 3 ngày) ===
+    last_hk = 0.0
+    HK_INTERVAL_SEC      = int(os.getenv("HK_INTERVAL_SEC", "3600"))  # 1 giờ
+    BUFFER_MAX_FILES     = int(os.getenv("BUFFER_MAX_FILES", str(cfg.wrap_segments)))
+    CLIPS_RETENTION_DAYS = int(os.getenv("CLIPS_RETENTION_DAYS", "3"))  # 3 ngày
+    # Đặt CLIPS_MAX_GB>0 để bật ép dung lượng tổng, 0 hoặc âm = tắt
+    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))
+
     try:
         for det in detector.stream_detect(src_ai, motion_gate=motion):
+            # Housekeeping theo chu kỳ
+            now = time.time()
+            if now - last_hk >= HK_INTERVAL_SEC:
+                # buffer/: giới hạn theo số file
+                total, removed = purge_oldest_by_count(cfg.buffer_dir, keep=BUFFER_MAX_FILES)
+                if removed:
+                    logger.info(f"[{cfg.name}] HK buffer: kept {BUFFER_MAX_FILES}/{total}, removed={removed}")
+
+                # clips/: xóa clip cũ theo ngày
+                rem_old = purge_older_than(cfg.clip_dir, days=CLIPS_RETENTION_DAYS)
+                if rem_old:
+                    logger.info(f"[{cfg.name}] HK clips: removed {rem_old} old files (> {CLIPS_RETENTION_DAYS}d)")
+
+                # clips/: ép tổng dung lượng (nếu bật)
+                if CLIPS_MAX_GB > 0:
+                    size_gb, rem_sz = purge_until_size(cfg.clip_dir, max_gb=CLIPS_MAX_GB)
+                    if rem_sz:
+                        logger.info(f"[{cfg.name}] HK clips size: now {size_gb:.2f} GB (removed {rem_sz})")
+
+                last_hk = now
+
             # Log detection (nếu bật)
             if LOG_DETECTION:
                 logger.info(f"[{cfg.name}] DET {det['class']} conf={det['conf']:.2f} bbox={det['bbox']}")
