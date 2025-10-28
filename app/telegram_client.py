@@ -1,62 +1,67 @@
-import requests, subprocess
-from pathlib import Path
+# app/telegram_client.py
+from __future__ import annotations
 import os
+import mimetypes
+import requests
 
 class TelegramClient:
     """
-    Hỗ trợ TELEGRAM_CHAT = "@handle" (group/channel public) hoặc ID số (vd: -1001234567890).
-    Tự động resolve @handle -> numeric chat_id qua getChat và cache trong self.chat_id.
+    Hỗ trợ:
+      - send_text
+      - send_video
+      - send_voice (voice note .ogg/opus)
+    chat có thể là @ten_nhom (public) hoặc id âm (private group).
     """
-    def __init__(self, token: str, chat: str, max_mb=49):
-        self.token = token
-        self.chat_input = chat.strip()
-        self.chat_id = None
-        self.max_bytes = max_mb * 1024 * 1024
 
-    def _api(self, method: str) -> str:
-        return f"https://api.telegram.org/bot{self.token}/{method}"
+    def __init__(self, bot_token: str, chat: str | int, max_mb: int = 45):
+        assert bot_token, "Telegram bot token required"
+        assert chat, "Telegram chat required"
+        self.token = bot_token              # lưu token thô
+        self.chat = chat
+        self.max_bytes = int(max_mb) * 1024 * 1024
 
-    def _resolve_chat_id(self):
-        if self.chat_id is not None:
-            return self.chat_id
-        ci = self.chat_input
-        if ci.startswith("@"):
-            r = requests.get(self._api("getChat"), params={"chat_id": ci}, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("ok"):
-                raise RuntimeError(f"getChat failed: {data}")
-            self.chat_id = data["result"]["id"]
-        else:
-            self.chat_id = int(ci)  # chấp nhận -100..., 12345...
-        return self.chat_id
+    @property
+    def base(self) -> str:
+        # Luôn tính động để tránh case self.base không tồn tại ở bản cũ
+        return f"https://api.telegram.org/bot{self.token}"
 
-    def send_text(self, text: str):
-        chat_id = self._resolve_chat_id()
-        r = requests.post(self._api("sendMessage"),
-                          json={"chat_id": chat_id, "text": text},
-                          timeout=20)
+    def _chat_id(self):
+        # nếu là số hoặc chuỗi số âm: dùng trực tiếp
+        try:
+            return int(self.chat)
+        except Exception:
+            # @username group/public channel
+            return self.chat
+
+    def send_text(self, text: str, parse_mode: str | None = None):
+        url = f"{self.base}/sendMessage"
+        data = {"chat_id": self._chat_id(), "text": text}
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        r = requests.post(url, data=data, timeout=30)
         r.raise_for_status()
+        return r.json()
 
-    def send_video(self, path: str, caption: str = ""):
-        chat_id = self._resolve_chat_id()
-        p = Path(path)
-        if p.stat().st_size > self.max_bytes:
-            out = p.with_suffix(".tgz.mp4")
-            cmd = ["ffmpeg","-nostdin","-loglevel","error","-y","-i",str(p),
-                   "-vf","scale=-2:720","-c:v","libx264","-preset","veryfast","-crf","28",
-                   "-movflags","+faststart","-an",str(out)]
-            subprocess.check_call(cmd)
-            p = out
-        with open(p, "rb") as f:
-            files = {"video": (p.name, f, "video/mp4")}
-            data = {"chat_id": chat_id, "caption": caption[:1024]}
-            r = requests.post(self._api("sendVideo"), data=data, files=files, timeout=120)
-            r.raise_for_status()
+    def send_video(self, path: str, caption: str | None = None):
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        if os.path.getsize(path) > self.max_bytes:
+            raise ValueError(f"Video too large (> {self.max_bytes} bytes)")
+
+        url = f"{self.base}/sendVideo"
+        mime = mimetypes.guess_type(path)[0] or "video/mp4"
+        with open(path, "rb") as f:
+            files = {"video": (os.path.basename(path), f, mime)}
+            data = {"chat_id": self._chat_id()}
+            if caption:
+                data["caption"] = caption
+            r = requests.post(url, data=data, files=files, timeout=120)
+        r.raise_for_status()
+        return r.json()
 
     def send_voice(self, path: str, caption: str | None = None):
         """
-        Gửi voice note: OGG/Opus (<= 50MB). Dùng sendVoice thay vì sendAudio để hiện dạng "voice".
+        Gửi voice note: OGG/Opus (≤ ~50MB). Dùng sendVoice để hiển thị dạng 'voice'.
         """
         if not os.path.exists(path):
             raise FileNotFoundError(path)
