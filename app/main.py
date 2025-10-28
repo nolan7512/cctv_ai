@@ -17,7 +17,8 @@ from app.housekeeping import (
     purge_older_than,
     purge_until_size,
 )
-from app.tts import TextToSpeech   # <<== NEW
+from app.tts import TextToSpeech   # nếu bạn không dùng TTS có thể bỏ import này
+
 
 def _spawn_gemini_worker(gem, tele, cam_name, clip_path, logger, skip_no_activity=True,
                          tts: TextToSpeech | None = None, tts_on_summary: bool = False,
@@ -93,7 +94,7 @@ def run():
     # Cổng chuyển động trên SUB (nhẹ)
     motion = MotionGate(min_pixels=cfg.motion_min_pixels, ratio=cfg.motion_ratio)
 
-    # Detector (YOLO)
+    # Detector (YOLO, PyTorch/TensorRT)
     detector = ObjectDetector(
         conf=cfg.conf, frame_stride=cfg.frame_stride,
         min_area=cfg.min_bbox_area, classes_of_interest=cfg.objects_of_interest,
@@ -129,39 +130,39 @@ def run():
 
     LOG_DETECTION = os.getenv("LOG_DETECTION", "no").lower() == "yes"
 
-    # Housekeeping cấu hình
+    # === Housekeeping cấu hình (mặc định: 1 giờ, giữ clip 3 ngày) ===
     last_hk = 0.0
-    HK_INTERVAL_SEC      = int(os.getenv("HK_INTERVAL_SEC", "3600"))
+    HK_INTERVAL_SEC      = int(os.getenv("HK_INTERVAL_SEC", "3600"))  # 1 giờ
     BUFFER_MAX_FILES     = int(os.getenv("BUFFER_MAX_FILES", str(cfg.wrap_segments)))
-    CLIPS_RETENTION_DAYS = int(os.getenv("CLIPS_RETENTION_DAYS", "3"))
-    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))
+    CLIPS_RETENTION_DAYS = int(os.getenv("CLIPS_RETENTION_DAYS", "3"))  # 3 ngày
+    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))  # >0 để bật ép dung lượng
 
-    # Debounce
+    # === Debounce/confirm & chặn event quá ngắn ===
     CONFIRM_FRAMES    = int(os.getenv("CONFIRM_FRAMES", "3"))
-    CONFIRM_WINDOW    = float(os.getenv("CONFIRM_WINDOW", "0.8"))
+    CONFIRM_WINDOW    = float(os.getenv("CONFIRM_WINDOW", "0.8"))   # giây
     MIN_EVENT_SECONDS = float(os.getenv("MIN_EVENT_SECONDS", "1.0"))
     _recent = defaultdict(lambda: deque())
 
-    # Blackout & NO_ACTIVITY
+    # === Blackout sau sự kiện & bỏ qua NO_ACTIVITY ===
     SKIP_NO_ACTIVITY = os.getenv("SKIP_NO_ACTIVITY", "yes").lower() == "yes"
     POST_EVENT_SILENCE_SEC = float(os.getenv("POST_EVENT_SILENCE_SEC", "8"))
     next_armed_ts = 0.0
 
-    # Gửi ngay & Gemini async
+    # === Gửi ngay & Gemini chạy nền ===
     SEND_IMMEDIATE = os.getenv("SEND_IMMEDIATE", "yes").lower() == "yes"
     GEMINI_ENABLE  = os.getenv("GEMINI_ENABLE",  "yes").lower() == "yes"
     GEMINI_ASYNC   = os.getenv("GEMINI_ASYNC",   "yes").lower() == "yes"
 
-    # Clamp t1
+    # === Clamp cửa sổ cắt để không yêu cầu phần chưa ghi xong ===
     CLIP_SAFETY_LAG = float(os.getenv("CLIP_SAFETY_LAG", "1.5"))
 
-    # === TTS config ===
+    # === TTS config (tuỳ chọn) ===
     TTS_ENABLE       = os.getenv("TTS_ENABLE", "yes").lower() == "yes"
     TTS_ENGINE       = os.getenv("TTS_ENGINE", "pyttsx3")
-    TTS_VOICE        = os.getenv("TTS_VOICE", "")         # ví dụ "Vietnamese" nếu hệ thống có giọng VI
+    TTS_VOICE        = os.getenv("TTS_VOICE", "")
     TTS_RATE         = int(os.getenv("TTS_RATE", "180"))
     TTS_VOLUME       = float(os.getenv("TTS_VOLUME", "1.0"))
-    TTS_ON_IMMEDIATE = os.getenv("TTS_ON_IMMEDIATE", "yes").lower() == "yes"
+    TTS_ON_IMMEDIATE = os.getenv("TTS_ON_IMMEDIATE", "no").lower() == "yes"   # bạn đang chỉ muốn summary
     TTS_ON_SUMMARY   = os.getenv("TTS_ON_SUMMARY", "yes").lower() == "yes"
 
     tts = None
@@ -174,42 +175,94 @@ def run():
             logger.warning(f"[{cfg.name}] TTS init failed: {e}")
             tts = None
 
+    # === Watchdog cấp ứng dụng ===
+    WATCHDOG_ENABLE = os.getenv("WATCHDOG_ENABLE", "yes").lower() == "yes"
+    WATCHDOG_STALL_SEC = float(os.getenv("WATCHDOG_STALL_SEC", "60"))         # không frame ≥ 60s → cảnh báo + reconnect
+    WATCHDOG_POLL_SEC  = float(os.getenv("WATCHDOG_POLL_SEC", "5"))           # chu kỳ kiểm tra
+    WATCHDOG_ALERT_COOLDOWN_SEC = float(os.getenv("WATCHDOG_ALERT_COOLDOWN_SEC", "180"))  # chống spam cảnh báo
+    WATCHDOG_EAGER_REOPEN = os.getenv("WATCHDOG_EAGER_REOPEN", "yes").lower() == "yes"
+
+    stop_wd = threading.Event()
+    wd_reconnects = {"count": 0}
+    wd_last_alert = {"ts": 0.0}
+    start_ts = time.time()
+
+    def _watchdog_loop():
+        cam = cfg.name
+        while not stop_wd.is_set():
+            try:
+                now = time.time()
+                last_ts = getattr(detector, "last_frame_ts", 0.0)
+                age = now - last_ts if last_ts > 0 else (now - start_ts)
+                # chỉ cảnh báo nếu vượt ngưỡng và qua cooldown
+                if age >= WATCHDOG_STALL_SEC and (now - wd_last_alert["ts"]) >= WATCHDOG_ALERT_COOLDOWN_SEC:
+                    wd_reconnects["count"] += 1
+                    msg = (f"⚠️ [{cam}] Luồng kẹt ≥ {int(WATCHDOG_STALL_SEC)}s "
+                           f"(lần watchdog reconnect #{wd_reconnects['count']}).")
+                    logger.warning(msg)
+                    try:
+                        tele.send_text(msg)
+                    except Exception:
+                        pass
+                    if WATCHDOG_EAGER_REOPEN:
+                        try:
+                            detector.request_reopen()
+                        except Exception:
+                            pass
+                    wd_last_alert["ts"] = now
+                # ngủ chu kỳ
+                stop_wd.wait(WATCHDOG_POLL_SEC)
+            except Exception as e:
+                logger.warning(f"[{cfg.name}] Watchdog loop error: {e}")
+                stop_wd.wait(WATCHDOG_POLL_SEC)
+
+    wd_thread = None
+    if WATCHDOG_ENABLE:
+        wd_thread = threading.Thread(target=_watchdog_loop, daemon=True)
+        wd_thread.start()
+        logger.info(f"[{cfg.name}] Watchdog enabled: stall={WATCHDOG_STALL_SEC}s, poll={WATCHDOG_POLL_SEC}s")
+
     try:
         for det in detector.stream_detect(src_ai, motion_gate=motion):
             now = time.time()
             if now < next_armed_ts:
                 continue
 
-            # Housekeeping
+            # Housekeeping theo chu kỳ
             if now - last_hk >= HK_INTERVAL_SEC:
                 total, removed = purge_oldest_by_count(cfg.buffer_dir, keep=BUFFER_MAX_FILES)
                 if removed:
                     logger.info(f"[{cfg.name}] HK buffer: kept {BUFFER_MAX_FILES}/{total}, removed={removed}")
+
                 rem_old = purge_older_than(cfg.clip_dir, days=CLIPS_RETENTION_DAYS)
                 if rem_old:
                     logger.info(f"[{cfg.name}] HK clips: removed {rem_old} old files (> {CLIPS_RETENTION_DAYS}d)")
+
                 if CLIPS_MAX_GB > 0:
                     size_gb, rem_sz = purge_until_size(cfg.clip_dir, max_gb=CLIPS_MAX_GB)
                     if rem_sz:
                         logger.info(f"[{cfg.name}] HK clips size: now {size_gb:.2f} GB (removed {rem_sz})")
+
                 last_hk = now
 
-            # Log detection
+            # Log detection (nếu bật)
             if LOG_DETECTION:
                 logger.info(f"[{cfg.name}] DET {det['class']} conf={det['conf']:.2f} bbox={det['bbox']}")
             else:
                 logger.debug(f"[{cfg.name}] det {det['class']} {det['conf']:.2f}")
 
-            ts = det["ts"]; cls = det["class"]
+            ts = det["ts"]
+            cls = det["class"]
 
-            # Debounce
-            dq = _recent[cls]; dq.append(ts)
+            # Debounce/confirm
+            dq = _recent[cls]
+            dq.append(ts)
             while dq and ts - dq[0] > CONFIRM_WINDOW:
                 dq.popleft()
             if len(dq) < CONFIRM_FRAMES:
                 continue
 
-            # Merge
+            # Gom event
             emitted = merger.push(cls, ts)
             if emitted is None:
                 emitted = merger.flush_due(ts)
@@ -220,14 +273,16 @@ def run():
             dur = max(0.0, t_last - t_first)
             logger.info(f"[{cfg.name}] EVENT {ev.cls} x{ev.count} window={dur:.1f}s")
 
+            # Bỏ qua event quá ngắn
             if dur < MIN_EVENT_SECONDS:
                 logger.info(f"[{cfg.name}] skip short event (<{MIN_EVENT_SECONDS}s)")
                 next_armed_ts = time.time() + min(POST_EVENT_SILENCE_SEC, 2.0)
                 continue
 
+            # Đặt blackout ngay khi chấp nhận event
             next_armed_ts = time.time() + POST_EVENT_SILENCE_SEC
 
-            # Tính cửa sổ clip
+            # Cửa sổ clip trên MAIN
             t0 = max(0.0, t_first - cfg.pre_roll)
             t1_req = t_last + cfg.post_roll
             now_ts = time.time()
@@ -238,7 +293,7 @@ def run():
 
             clip_full = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}.mp4")
 
-            # Cắt clip
+            # Cắt clip (copy stream, rất nhanh)
             t_clip = time.perf_counter()
             try:
                 logger.info(f"[{cfg.name}] clip_window=[{t0:.2f},{t1:.2f}] (req_end={t1_req:.2f}, now={now_ts:.2f})")
@@ -253,17 +308,16 @@ def run():
                 continue
             logger.info(f"[{cfg.name}] T_clip={(time.perf_counter()-t_clip):.2f}s")
 
-            # Gửi NGAY text + (tuỳ chọn) voice
+            # Gửi NGAY text (nếu bật)
             if SEND_IMMEDIATE:
                 prelim = f"Sự kiện: {ev.cls} x{ev.count} ({dur:.1f}s) — đang phân tích…"
                 try:
                     tele.send_text(f"🔔 [{cfg.name}] {prelim}")
                 except Exception:
                     pass
-                if tts and TTS_ON_IMMEDIATE:
-                    _spawn_tts_voice(tts, tele, cfg.name, prelim, cfg.clip_dir, logger)
+                # (Bạn đang dùng TTS cho summary, nên mặc định TTS_ON_IMMEDIATE=no)
 
-            # Nén nhẹ cho Gemini
+            # Nén nhẹ cho Gemini (ultrafast)
             clip_lite = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}_720p.mp4")
             t_comp = time.perf_counter()
             try:
@@ -309,7 +363,7 @@ def run():
             # Gửi video (nếu bật)
             if cfg.send_video:
                 try:
-                    tele.send_video(clip_full, caption=f"{cfg.name} Clip giám sát")
+                    tele.send_video(clip_full, caption=f"{cfg.name} event clip")
                     logger.info(f"[{cfg.name}] Telegram video sent")
                 except Exception as e:
                     logger.exception(f"[{cfg.name}] Telegram video failed")
@@ -321,6 +375,14 @@ def run():
     except KeyboardInterrupt:
         pass
     finally:
+        # dừng watchdog
+        try:
+            stop_wd.set()
+            if wd_thread:
+                wd_thread.join(timeout=2)
+        except Exception:
+            pass
+
         rb.stop()
         logger.info(f"[{cfg.name}] stopped.")
         try:
