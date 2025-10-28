@@ -6,7 +6,8 @@ from pathlib import Path
 class TextToSpeech:
     """
     Engine:
-      - 'edge'   : Microsoft Edge TTS (online), ví dụ voice 'vi-VN-HoaiMyNeural' (nữ)
+      - 'edge'   : Microsoft Edge TTS (online), ví dụ voice 'vi-VN-HoaiMyNeural' (nữ).
+                   Lưu MP3 rồi convert sang OGG Opus để gửi Telegram voice.
       - 'pyttsx3': Offline SAPI5 (Windows). Cần cài voice VI, nếu không sẽ phát âm sai.
     """
 
@@ -21,11 +22,10 @@ class TextToSpeech:
             try:
                 import edge_tts  # type: ignore
             except Exception as e:
-                raise RuntimeError("edge-tts not installed. Add edge-tts to requirements.txt") from e
+                raise RuntimeError("edge-tts not installed. Add `edge-tts` to requirements.txt") from e
             self.edge_tts = edge_tts
             # Mặc định giọng nữ Việt:
             self.voice = self.voice_substr or "vi-VN-HoaiMyNeural"
-            # Edge-tts dùng định dạng rate theo %, mình giữ nguyên text bạn đưa vào pyttsx3 (int) nhưng không dùng ở đây.
         else:
             try:
                 import pyttsx3  # type: ignore
@@ -58,7 +58,6 @@ class TextToSpeech:
                     if ("vi" in langs_s) or ("vietnam" in name.lower()) or ("viet" in name.lower()):
                         chosen = v.id; break
             if not chosen and want:
-                # fallback: duyệt lần nữa chỉ theo name
                 for v in voices:
                     name = getattr(v, "name", "") or ""
                     if want in name.lower():
@@ -68,13 +67,19 @@ class TextToSpeech:
                     self.engine.setProperty("voice", chosen)
                 except Exception:
                     pass
-            # Log nhẹ các voice sẵn có (1 lần)
+            # In danh sách 1 phần voice sẵn có (debug)
             try:
                 listing = [f"- {getattr(v,'name','?')} ({getattr(v,'id','?')})"
                            for v in voices[:10]]
                 print("[TTS] Available voices (first 10):\n" + "\n".join(listing))
             except Exception:
                 pass
+
+    def _ffmpeg_to_ogg(self, src_path: str, out_path: str):
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        # Cần ffmpeg trong PATH (Windows: đặt ffmpeg.exe vào PATH hoặc cùng thư mục script)
+        cmd = ["ffmpeg", "-y", "-i", src_path, "-c:a", "libopus", "-b:a", "32k", out_path]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # === API thống nhất ===
     def speak_to_ogg(self, text: str, out_path: str) -> str:
@@ -84,11 +89,18 @@ class TextToSpeech:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
         if self.engine_name == "edge":
-            fmt = "audio/ogg; codecs=opus"
-            async def _run():
+            # Lưu MP3 bằng edge-tts → convert sang OGG/Opus
+            async def _run(mp3_path: str):
                 comm = self.edge_tts.Communicate(text, self.voice)
-                await comm.save(out_path, format=fmt)
-            asyncio.run(_run())
+                await comm.save(mp3_path)  # KHÔNG có tham số 'format' trong các bản edge-tts hiện tại
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+                tmp_mp3 = tf.name
+            try:
+                asyncio.run(_run(tmp_mp3))
+                self._ffmpeg_to_ogg(tmp_mp3, out_path)
+            finally:
+                try: os.remove(tmp_mp3)
+                except Exception: pass
             return out_path
 
         # pyttsx3: ghi WAV tạm → ffmpeg -> OGG/Opus
@@ -97,9 +109,7 @@ class TextToSpeech:
         try:
             self.engine.save_to_file(text, tmp_wav)
             self.engine.runAndWait()
-            # Cần ffmpeg trong PATH
-            cmd = ["ffmpeg", "-y", "-i", tmp_wav, "-c:a", "libopus", "-b:a", "32k", out_path]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._ffmpeg_to_ogg(tmp_wav, out_path)
         finally:
             try: os.remove(tmp_wav)
             except Exception: pass
