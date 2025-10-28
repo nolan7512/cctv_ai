@@ -3,6 +3,7 @@
 ## 1) Install
 ```bash
 pip install -r requirements.txt
+pip install -U ultralytics
 # FFmpeg: ensure it's on PATH (Windows: add bin; Ubuntu: apt install ffmpeg)
 ```
 
