@@ -1,5 +1,5 @@
 # app/main.py
-import argparse, time, os
+import argparse, time, os, threading
 from pathlib import Path
 from collections import defaultdict, deque
 
@@ -17,6 +17,28 @@ from app.housekeeping import (
     purge_older_than,
     purge_until_size,
 )
+
+def _spawn_gemini_worker(gem, tele, cam_name, clip_path, logger, skip_no_activity=True):
+    """Chạy phân tích Gemini ở nền và gửi summary khi xong (không chặn luồng chính)."""
+    def _work():
+        t2 = time.perf_counter()
+        try:
+            summary = gem.analyze_video(clip_path)  # "NO_ACTIVITY" hoặc mô tả ngắn
+            dt = time.perf_counter() - t2
+            logger.info(f"[{cam_name}] T_gemini={dt:.2f}s")
+            if skip_no_activity and summary.strip().upper() == "NO_ACTIVITY":
+                logger.info(f"[{cam_name}] Gemini: NO_ACTIVITY → skip notify")
+                return
+            tele.send_text(f"🎥 [{cam_name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}")
+            logger.info(f"[{cam_name}] Gemini summary sent (async)")
+        except Exception as e:
+            logger.exception(f"[{cam_name}] Gemini async failed: {e}")
+            try:
+                tele.send_text(f"⚠️[{cam_name}] Gemini failed: {e}")
+            except Exception:
+                pass
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
 
 
 def run():
@@ -70,7 +92,7 @@ def run():
     # Thông báo start
     try:
         tele.send_text(
-            f"✅ [{cfg.name}] started. Đang chạy giám sát "
+            f"✅ [{cfg.name}] started. Watching AI stream; ring-buffer active. "
             f"Device={getattr(detector,'device','cpu')} FP16={getattr(detector,'use_fp16',False)}"
         )
     except Exception as e:
@@ -95,6 +117,11 @@ def run():
     SKIP_NO_ACTIVITY = os.getenv("SKIP_NO_ACTIVITY", "yes").lower() == "yes"
     POST_EVENT_SILENCE_SEC = float(os.getenv("POST_EVENT_SILENCE_SEC", "8"))
     next_armed_ts = 0.0  # thời điểm sớm nhất cho phép nhận event kế tiếp
+
+    # === Gửi ngay & Gemini chạy nền ===
+    SEND_IMMEDIATE = os.getenv("SEND_IMMEDIATE", "yes").lower() == "yes"
+    GEMINI_ENABLE  = os.getenv("GEMINI_ENABLE",  "yes").lower() == "yes"
+    GEMINI_ASYNC   = os.getenv("GEMINI_ASYNC",   "yes").lower() == "yes"
 
     try:
         for det in detector.stream_detect(src_ai, motion_gate=motion):
@@ -149,7 +176,7 @@ def run():
             dur = max(0.0, t_last - t_first)
             logger.info(f"[{cfg.name}] EVENT {ev.cls} x{ev.count} window={dur:.1f}s")
 
-            # Bỏ qua event quá ngắn (thường là nhiễu/chớp)
+            # Bỏ qua event quá ngắn
             if dur < MIN_EVENT_SECONDS:
                 logger.info(f"[{cfg.name}] skip short event (<{MIN_EVENT_SECONDS}s)")
                 # vẫn đặt blackout ngắn để triệt vòng lặp cùng frame
@@ -164,7 +191,8 @@ def run():
             t1 = t_last + cfg.post_roll
             clip_full = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}.mp4")
 
-            # Cắt clip
+            # Cắt clip (copy stream, rất nhanh)
+            t_clip = time.perf_counter()
             try:
                 rb.make_clip(t0, t1, clip_full)
                 logger.info(f"[{cfg.name}] Clip OK → {clip_full}")
@@ -175,11 +203,21 @@ def run():
                 except Exception:
                     pass
                 continue
+            logger.info(f"[{cfg.name}] T_clip={(time.perf_counter()-t_clip):.2f}s")
 
-            # Nén nhẹ cho Gemini
+            # Gửi tin nhắn NGAY (không đợi nén/Gemini), nếu bật
+            if SEND_IMMEDIATE:
+                try:
+                    tele.send_text(f"🔔 [{cfg.name}] sự kiện: Đã phát hiện chuyển động {ev.cls} x{ev.count} ({dur:.1f}s) — đang phân tích…")
+                except Exception:
+                    pass
+
+            # Nén nhẹ cho Gemini (ultrafast)
             clip_lite = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}_720p.mp4")
+            t_comp = time.perf_counter()
             try:
-                make_gemini_lite(clip_full, clip_lite, scale_short_side=720, crf=28)
+                # crf=30 để nhanh; có thể chỉnh bằng ENV FFMPEG_PRESET/FFMPEG_TUNE
+                make_gemini_lite(clip_full, clip_lite, scale_short_side=720, crf=30)
                 logger.info(f"[{cfg.name}] Compress OK → {clip_lite}")
             except Exception as e:
                 logger.warning(f"[{cfg.name}] Compress failed → dùng full. err={e}")
@@ -188,23 +226,28 @@ def run():
                 except Exception:
                     pass
                 clip_lite = clip_full
+            logger.info(f"[{cfg.name}] T_compress={(time.perf_counter()-t_comp):.2f}s")
 
-            # Gọi Gemini: chỉ lấy Summary hành động; bỏ qua nếu NO_ACTIVITY
-            try:
-                summary = gem.analyze_video(clip_lite)  # chuỗi tiếng Việt hoặc "NO_ACTIVITY"
-                if SKIP_NO_ACTIVITY and summary.strip().upper() == "NO_ACTIVITY":
-                    logger.info(f"[{cfg.name}] Gemini: NO_ACTIVITY → skip notify")
-                    continue
-
-                txt = f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}"
-                tele.send_text(txt)
-                logger.info(f"[{cfg.name}] Gemini summary sent")
-            except Exception as e:
-                logger.exception(f"[{cfg.name}] Gemini failed")
-                try:
-                    tele.send_text(f"⚠️[{cfg.name}] Gemini failed: {e}")
-                except Exception:
-                    pass
+            # Phân tích Gemini (có thể chạy nền)
+            if GEMINI_ENABLE:
+                if GEMINI_ASYNC:
+                    _spawn_gemini_worker(gem, tele, cfg.name, clip_lite, logger, skip_no_activity=SKIP_NO_ACTIVITY)
+                else:
+                    t2 = time.perf_counter()
+                    try:
+                        summary = gem.analyze_video(clip_lite)
+                        logger.info(f"[{cfg.name}] T_gemini={(time.perf_counter()-t2):.2f}s")
+                        if SKIP_NO_ACTIVITY and summary.strip().upper() == "NO_ACTIVITY":
+                            logger.info(f"[{cfg.name}] Gemini: NO_ACTIVITY → skip notify")
+                        else:
+                            tele.send_text(f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}")
+                            logger.info(f"[{cfg.name}] Gemini summary sent")
+                    except Exception as e:
+                        logger.exception(f"[{cfg.name}] Gemini failed")
+                        try:
+                            tele.send_text(f"⚠️[{cfg.name}] Gemini failed: {e}")
+                        except Exception:
+                            pass
 
             # Gửi video (nếu bật)
             if cfg.send_video:
