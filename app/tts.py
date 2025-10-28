@@ -1,60 +1,106 @@
 # app/tts.py
 from __future__ import annotations
-import os, tempfile, subprocess
+import os, asyncio, tempfile, subprocess
 from pathlib import Path
-from typing import Optional
 
 class TextToSpeech:
     """
-    TTS offline bằng pyttsx3 (SAPI5 trên Windows, NSSpeech/Espeak trên macOS/Linux).
-    Quy trình: text -> WAV (offline) -> FFmpeg -> OGG Opus (hợp lệ cho Telegram sendVoice).
+    Engine:
+      - 'edge'   : Microsoft Edge TTS (online), ví dụ voice 'vi-VN-HoaiMyNeural' (nữ)
+      - 'pyttsx3': Offline SAPI5 (Windows). Cần cài voice VI, nếu không sẽ phát âm sai.
     """
-    def __init__(self, engine_name: str = "pyttsx3", voice_substr: Optional[str] = None,
-                 rate: int = 180, volume: float = 1.0, ffmpeg_path: str = "ffmpeg"):
-        if engine_name.lower() != "pyttsx3":
-            raise ValueError("Only 'pyttsx3' engine is supported in this build.")
-        import pyttsx3  # lazy import
-        self.engine = pyttsx3.init()
-        # chọn voice theo substring (nếu cung cấp)
-        self._select_voice(voice_substr)
-        self.engine.setProperty("rate", int(rate))
-        self.engine.setProperty("volume", float(volume))
-        self.ffmpeg = ffmpeg_path
 
-    def _select_voice(self, voice_substr: Optional[str]):
-        if not voice_substr:
-            return
-        voices = self.engine.getProperty("voices") or []
-        vs = voice_substr.lower()
-        for v in voices:
-            name = (getattr(v, "name", "") or "").lower()
-            lang = ",".join(getattr(v, "languages", []) or []).lower()
-            _id  = (getattr(v, "id", "") or "").lower()
-            if vs in name or vs in lang or vs in _id:
-                self.engine.setProperty("voice", v.id)
-                break
+    def __init__(self, engine_name: str = "pyttsx3", voice_substr: str = "",
+                 rate: int | float = 180, volume: float = 1.0):
+        self.engine_name = (engine_name or "pyttsx3").lower().strip()
+        self.voice_substr = voice_substr or ""
+        self.rate = rate
+        self.volume = volume
 
-    def synth_wav(self, text: str, wav_path: str):
-        self.engine.save_to_file(text, wav_path)
-        self.engine.runAndWait()
+        if self.engine_name == "edge":
+            try:
+                import edge_tts  # type: ignore
+            except Exception as e:
+                raise RuntimeError("edge-tts not installed. Add edge-tts to requirements.txt") from e
+            self.edge_tts = edge_tts
+            # Mặc định giọng nữ Việt:
+            self.voice = self.voice_substr or "vi-VN-HoaiMyNeural"
+            # Edge-tts dùng định dạng rate theo %, mình giữ nguyên text bạn đưa vào pyttsx3 (int) nhưng không dùng ở đây.
+        else:
+            try:
+                import pyttsx3  # type: ignore
+            except Exception as e:
+                raise RuntimeError("pyttsx3 not installed.") from e
+            self.pyttsx3 = pyttsx3
+            self.engine = pyttsx3.init()
+            # Rate/volume (pyttsx3)
+            try:
+                self.engine.setProperty("rate", int(self.rate))
+            except Exception:
+                pass
+            try:
+                self.engine.setProperty("volume", max(0.0, min(1.0, float(self.volume))))
+            except Exception:
+                pass
 
-    def wav_to_ogg(self, wav_path: str, ogg_path: str, bitrate_kbps: int = 24, ar: int = 24000):
+            # Chọn voice theo substring (ưu tiên VI nếu không chỉ rõ)
+            chosen = None
+            voices = self.engine.getProperty("voices") or []
+            want = (self.voice_substr or "").lower()
+            for v in voices:
+                name = getattr(v, "name", "") or ""
+                langs = getattr(v, "languages", []) or []
+                langs_s = " ".join([str(x) for x in langs]).lower()
+                if want:
+                    if want in name.lower():
+                        chosen = v.id; break
+                else:
+                    if ("vi" in langs_s) or ("vietnam" in name.lower()) or ("viet" in name.lower()):
+                        chosen = v.id; break
+            if not chosen and want:
+                # fallback: duyệt lần nữa chỉ theo name
+                for v in voices:
+                    name = getattr(v, "name", "") or ""
+                    if want in name.lower():
+                        chosen = v.id; break
+            if chosen:
+                try:
+                    self.engine.setProperty("voice", chosen)
+                except Exception:
+                    pass
+            # Log nhẹ các voice sẵn có (1 lần)
+            try:
+                listing = [f"- {getattr(v,'name','?')} ({getattr(v,'id','?')})"
+                           for v in voices[:10]]
+                print("[TTS] Available voices (first 10):\n" + "\n".join(listing))
+            except Exception:
+                pass
+
+    # === API thống nhất ===
+    def speak_to_ogg(self, text: str, out_path: str) -> str:
         """
-        Convert WAV -> OGG/Opus (Telegram sendVoice yêu cầu OGG/Opus).
+        Tạo file .ogg (Opus) sẵn sàng gửi Telegram voice (sendVoice).
         """
-        cmd = [
-            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-i", wav_path,
-            "-c:a", "libopus", "-b:a", f"{bitrate_kbps}k", "-ar", str(ar),
-            "-vn",
-            ogg_path,
-        ]
-        subprocess.run(cmd, check=True)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    def speak_to_ogg(self, text: str, ogg_path: str, bitrate_kbps: int = 24, ar: int = 24000):
-        Path(ogg_path).parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory() as td:
-            wav_tmp = str(Path(td) / "tmp.wav")
-            self.synth_wav(text, wav_tmp)
-            self.wav_to_ogg(wav_tmp, ogg_path, bitrate_kbps=bitrate_kbps, ar=ar)
-        return ogg_path
+        if self.engine_name == "edge":
+            fmt = "audio/ogg; codecs=opus"
+            async def _run():
+                comm = self.edge_tts.Communicate(text, self.voice)
+                await comm.save(out_path, format=fmt)
+            asyncio.run(_run())
+            return out_path
+
+        # pyttsx3: ghi WAV tạm → ffmpeg -> OGG/Opus
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tmp_wav = tf.name
+        try:
+            self.engine.save_to_file(text, tmp_wav)
+            self.engine.runAndWait()
+            # Cần ffmpeg trong PATH
+            cmd = ["ffmpeg", "-y", "-i", tmp_wav, "-c:a", "libopus", "-b:a", "32k", out_path]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            try: os.remove(tmp_wav)
+            except Exception: pass
+        return out_path
