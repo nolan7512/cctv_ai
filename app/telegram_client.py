@@ -52,3 +52,22 @@ class TelegramClient:
             data = {"chat_id": chat_id, "caption": caption[:1024]}
             r = requests.post(self._api("sendVideo"), data=data, files=files, timeout=120)
             r.raise_for_status()
+
+    def send_voice(self, path: str, caption: str | None = None):
+        """
+        Gửi voice note: OGG/Opus (<= 50MB). Dùng sendVoice thay vì sendAudio để hiện dạng "voice".
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        if os.path.getsize(path) > self.max_bytes:
+            raise ValueError(f"Voice too large (> {self.max_bytes} bytes)")
+
+        url = f"{self.base}/sendVoice"
+        with open(path, "rb") as f:
+            files = {"voice": (os.path.basename(path), f, "audio/ogg")}
+            data = {"chat_id": self._chat_id()}
+            if caption:
+                data["caption"] = caption
+            r = requests.post(url, data=data, files=files, timeout=120)
+        r.raise_for_status()
+        return r.json()
