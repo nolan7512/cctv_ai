@@ -108,8 +108,8 @@ def run():
     CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))  # >0 để bật ép dung lượng
 
     # === Debounce/confirm & chặn event quá ngắn ===
-    CONFIRM_FRAMES   = int(os.getenv("CONFIRM_FRAMES", "3"))
-    CONFIRM_WINDOW   = float(os.getenv("CONFIRM_WINDOW", "0.8"))   # giây
+    CONFIRM_FRAMES    = int(os.getenv("CONFIRM_FRAMES", "3"))
+    CONFIRM_WINDOW    = float(os.getenv("CONFIRM_WINDOW", "0.8"))   # giây
     MIN_EVENT_SECONDS = float(os.getenv("MIN_EVENT_SECONDS", "1.0"))
     _recent = defaultdict(lambda: deque())  # class -> deque các timestamp gần nhất
 
@@ -122,6 +122,9 @@ def run():
     SEND_IMMEDIATE = os.getenv("SEND_IMMEDIATE", "yes").lower() == "yes"
     GEMINI_ENABLE  = os.getenv("GEMINI_ENABLE",  "yes").lower() == "yes"
     GEMINI_ASYNC   = os.getenv("GEMINI_ASYNC",   "yes").lower() == "yes"
+
+    # === Clamp cửa sổ cắt để không yêu cầu phần chưa ghi xong ===
+    CLIP_SAFETY_LAG = float(os.getenv("CLIP_SAFETY_LAG", "1.5"))  # đợi hậu kỳ 1.5s
 
     try:
         for det in detector.stream_detect(src_ai, motion_gate=motion):
@@ -188,12 +191,22 @@ def run():
 
             # Cửa sổ clip trên MAIN
             t0 = max(0.0, t_first - cfg.pre_roll)
-            t1 = t_last + cfg.post_roll
+            t1_req = t_last + cfg.post_roll
+
+            # Clamp t1 để không yêu cầu phần chưa ghi xong (tránh "No segment overlaps detection window")
+            now_ts = time.time()
+            t1 = min(t1_req, now_ts - CLIP_SAFETY_LAG)
+
+            if t1 <= t0:
+                logger.info(f"[{cfg.name}] clip window empty after clamp: t0={t0:.2f}, t1={t1:.2f}, now={now_ts:.2f}")
+                continue
+
             clip_full = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}.mp4")
 
             # Cắt clip (copy stream, rất nhanh)
             t_clip = time.perf_counter()
             try:
+                logger.info(f"[{cfg.name}] clip_window=[{t0:.2f},{t1:.2f}] (req_end={t1_req:.2f}, now={now_ts:.2f})")
                 rb.make_clip(t0, t1, clip_full)
                 logger.info(f"[{cfg.name}] Clip OK → {clip_full}")
             except Exception as e:
@@ -208,7 +221,7 @@ def run():
             # Gửi tin nhắn NGAY (không đợi nén/Gemini), nếu bật
             if SEND_IMMEDIATE:
                 try:
-                    tele.send_text(f"🔔 [{cfg.name}] sự kiện: Đã phát hiện chuyển động {ev.cls} x{ev.count} ({dur:.1f}s) — đang phân tích…")
+                    tele.send_text(f"🔔 [{cfg.name}] Cảnh báo sự kiện: {ev.cls} x{ev.count} ({dur:.1f}s) — đang phân tích…")
                 except Exception:
                     pass
 
@@ -252,7 +265,7 @@ def run():
             # Gửi video (nếu bật)
             if cfg.send_video:
                 try:
-                    tele.send_video(clip_full, caption=f"{cfg.name} event clip")
+                    tele.send_video(clip_full, caption=f"{cfg.name} Clip sự kiện")
                     logger.info(f"[{cfg.name}] Telegram video sent")
                 except Exception as e:
                     logger.exception(f"[{cfg.name}] Telegram video failed")
