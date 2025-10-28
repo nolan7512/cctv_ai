@@ -1,5 +1,6 @@
 import requests, subprocess
 from pathlib import Path
+import os
 
 class TelegramClient:
     """
