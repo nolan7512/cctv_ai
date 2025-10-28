@@ -17,7 +17,7 @@ from app.housekeeping import (
     purge_older_than,
     purge_until_size,
 )
-from app.tts import TextToSpeech   # nếu bạn không dùng TTS có thể bỏ import này
+from app.tts import TextToSpeech   # nếu không dùng TTS có thể bỏ import này
 
 
 def _spawn_gemini_worker(gem, tele, cam_name, clip_path, logger, skip_no_activity=True,
@@ -109,8 +109,9 @@ def run():
     # Gemini
     gem = GeminiClient(cfg.gemini_api_key, cfg.gemini_model, use_vertex=cfg.use_vertex)
 
-    # Gom sự kiện
+    # Gom sự kiện (idle-end = merge_window_seconds)
     merger = EventMerger(merge_window=cfg.merge_window_seconds, cooldown=cfg.cooldown_seconds)
+    logger.info(f"[{cfg.name}] merger idle_end={merger.idle_end}s cooldown={merger.cooldown}s")
 
     # Nguồn AI ưu tiên SUB
     src_ai = cfg.rtsp_url_sub or cfg.rtsp_url
@@ -130,12 +131,12 @@ def run():
 
     LOG_DETECTION = os.getenv("LOG_DETECTION", "no").lower() == "yes"
 
-    # === Housekeeping cấu hình (mặc định: 1 giờ, giữ clip 3 ngày) ===
+    # === Housekeeping cấu hình ===
     last_hk = 0.0
-    HK_INTERVAL_SEC      = int(os.getenv("HK_INTERVAL_SEC", "3600"))  # 1 giờ
+    HK_INTERVAL_SEC      = int(os.getenv("HK_INTERVAL_SEC", "7200"))
     BUFFER_MAX_FILES     = int(os.getenv("BUFFER_MAX_FILES", str(cfg.wrap_segments)))
-    CLIPS_RETENTION_DAYS = int(os.getenv("CLIPS_RETENTION_DAYS", "3"))  # 3 ngày
-    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))  # >0 để bật ép dung lượng
+    CLIPS_RETENTION_DAYS = int(os.getenv("CLIPS_RETENTION_DAYS", "3"))
+    CLIPS_MAX_GB         = float(os.getenv("CLIPS_MAX_GB", "0"))
 
     # === Debounce/confirm & chặn event quá ngắn ===
     CONFIRM_FRAMES    = int(os.getenv("CONFIRM_FRAMES", "3"))
@@ -162,7 +163,7 @@ def run():
     TTS_VOICE        = os.getenv("TTS_VOICE", "")
     TTS_RATE         = int(os.getenv("TTS_RATE", "180"))
     TTS_VOLUME       = float(os.getenv("TTS_VOLUME", "1.0"))
-    TTS_ON_IMMEDIATE = os.getenv("TTS_ON_IMMEDIATE", "no").lower() == "yes"   # bạn đang chỉ muốn summary
+    TTS_ON_IMMEDIATE = os.getenv("TTS_ON_IMMEDIATE", "no").lower() == "yes"
     TTS_ON_SUMMARY   = os.getenv("TTS_ON_SUMMARY", "yes").lower() == "yes"
 
     tts = None
@@ -177,9 +178,9 @@ def run():
 
     # === Watchdog cấp ứng dụng ===
     WATCHDOG_ENABLE = os.getenv("WATCHDOG_ENABLE", "yes").lower() == "yes"
-    WATCHDOG_STALL_SEC = float(os.getenv("WATCHDOG_STALL_SEC", "60"))         # không frame ≥ 60s → cảnh báo + reconnect
-    WATCHDOG_POLL_SEC  = float(os.getenv("WATCHDOG_POLL_SEC", "5"))           # chu kỳ kiểm tra
-    WATCHDOG_ALERT_COOLDOWN_SEC = float(os.getenv("WATCHDOG_ALERT_COOLDOWN_SEC", "180"))  # chống spam cảnh báo
+    WATCHDOG_STALL_SEC = float(os.getenv("WATCHDOG_STALL_SEC", "60"))
+    WATCHDOG_POLL_SEC  = float(os.getenv("WATCHDOG_POLL_SEC", "5"))
+    WATCHDOG_ALERT_COOLDOWN_SEC = float(os.getenv("WATCHDOG_ALERT_COOLDOWN_SEC", "180"))
     WATCHDOG_EAGER_REOPEN = os.getenv("WATCHDOG_EAGER_REOPEN", "yes").lower() == "yes"
 
     stop_wd = threading.Event()
@@ -194,7 +195,6 @@ def run():
                 now = time.time()
                 last_ts = getattr(detector, "last_frame_ts", 0.0)
                 age = now - last_ts if last_ts > 0 else (now - start_ts)
-                # chỉ cảnh báo nếu vượt ngưỡng và qua cooldown
                 if age >= WATCHDOG_STALL_SEC and (now - wd_last_alert["ts"]) >= WATCHDOG_ALERT_COOLDOWN_SEC:
                     wd_reconnects["count"] += 1
                     msg = (f"⚠️ [{cam}] Luồng kẹt ≥ {int(WATCHDOG_STALL_SEC)}s "
@@ -210,7 +210,6 @@ def run():
                         except Exception:
                             pass
                     wd_last_alert["ts"] = now
-                # ngủ chu kỳ
                 stop_wd.wait(WATCHDOG_POLL_SEC)
             except Exception as e:
                 logger.warning(f"[{cfg.name}] Watchdog loop error: {e}")
@@ -221,6 +220,131 @@ def run():
         wd_thread = threading.Thread(target=_watchdog_loop, daemon=True)
         wd_thread.start()
         logger.info(f"[{cfg.name}] Watchdog enabled: stall={WATCHDOG_STALL_SEC}s, poll={WATCHDOG_POLL_SEC}s")
+
+    # === Idle-flush thread: tự đóng event khi im lặng dù không có detect mới ===
+    FLUSH_TICK_SEC = float(os.getenv("FLUSH_TICK_SEC", "0.5"))
+    stop_flush = threading.Event()
+
+    def process_emitted(emitted):
+        nonlocal next_armed_ts
+        t_first, t_last, ev = emitted
+        dur = max(0.0, t_last - t_first)
+        logger.info(f"[{cfg.name}] EVENT {ev.cls} x{ev.count} window={dur:.1f}s")
+
+        # Bỏ qua event quá ngắn
+        if dur < MIN_EVENT_SECONDS:
+            logger.info(f"[{cfg.name}] skip short event (<{MIN_EVENT_SECONDS}s)")
+            next_armed_ts = time.time() + min(POST_EVENT_SILENCE_SEC, 2.0)
+            return
+
+        # Blackout ngay khi chấp nhận event
+        next_armed_ts = time.time() + POST_EVENT_SILENCE_SEC
+
+        # Cửa sổ clip trên MAIN + clamp phần chưa ghi xong
+        t0 = max(0.0, t_first - cfg.pre_roll)
+        t1_req = t_last + cfg.post_roll
+        now_ts = time.time()
+        t1 = min(t1_req, now_ts - CLIP_SAFETY_LAG)
+        if t1 <= t0:
+            logger.info(f"[{cfg.name}] clip window empty after clamp: t0={t0:.2f}, t1={t1:.2f}, now={now_ts:.2f}")
+            return
+
+        clip_full = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}.mp4")
+
+        # Cắt clip (copy stream)
+        t_clip = time.perf_counter()
+        try:
+            logger.info(f"[{cfg.name}] clip_window=[{t0:.2f},{t1:.2f}] (req_end={t1_req:.2f}, now={now_ts:.2f})")
+            rb.make_clip(t0, t1, clip_full)
+            logger.info(f"[{cfg.name}] Clip OK → {clip_full}")
+        except Exception as e:
+            logger.exception(f"[{cfg.name}] Clip failed")
+            try:
+                tele.send_text(f"❗️[{cfg.name}] Clip failed: {e}")
+            except Exception:
+                pass
+            return
+        logger.info(f"[{cfg.name}] T_clip={(time.perf_counter()-t_clip):.2f}s")
+
+        # Gửi NGAY text sơ bộ (nếu bật)
+        if SEND_IMMEDIATE:
+            prelim = f"Sự kiện: {ev.cls} x{ev.count} ({dur:.1f}s) — đang phân tích…"
+            try:
+                tele.send_text(f"🔔 [{cfg.name}] {prelim}")
+                if tts and TTS_ON_IMMEDIATE:
+                    _spawn_tts_voice(tts, tele, cfg.name, prelim, cfg.clip_dir, logger)
+            except Exception:
+                pass
+
+        # Nén nhẹ cho Gemini
+        clip_lite = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}_720p.mp4")
+        t_comp = time.perf_counter()
+        try:
+            make_gemini_lite(clip_full, clip_lite, scale_short_side=720, crf=30)
+            logger.info(f"[{cfg.name}] Compress OK → {clip_lite}")
+        except Exception as e:
+            logger.warning(f"[{cfg.name}] Compress failed → dùng full. err={e}")
+            try:
+                tele.send_text(f"⚠️[{cfg.name}] Compress failed: {e}")
+            except Exception:
+                pass
+            clip_lite = clip_full
+        logger.info(f"[{cfg.name}] T_compress={(time.perf_counter()-t_comp):.2f}s")
+
+        # Gemini (async/sync) + (tuỳ chọn) voice summary
+        if GEMINI_ENABLE:
+            if GEMINI_ASYNC:
+                _spawn_gemini_worker(
+                    gem, tele, cfg.name, clip_lite, logger,
+                    skip_no_activity=SKIP_NO_ACTIVITY,
+                    tts=tts, tts_on_summary=TTS_ON_SUMMARY, clip_dir=cfg.clip_dir
+                )
+            else:
+                t2 = time.perf_counter()
+                try:
+                    summary = gem.analyze_video(clip_lite)
+                    logger.info(f"[{cfg.name}] T_gemini={(time.perf_counter()-t2):.2f}s")
+                    if SKIP_NO_ACTIVITY and summary.strip().upper() == "NO_ACTIVITY":
+                        logger.info(f"[{cfg.name}] Gemini: NO_ACTIVITY → skip notify")
+                    else:
+                        msg = f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}"
+                        tele.send_text(msg)
+                        if tts and TTS_ON_SUMMARY:
+                            _spawn_tts_voice(tts, tele, cfg.name, summary, cfg.clip_dir, logger)
+                        logger.info(f"[{cfg.name}] Gemini summary sent")
+                except Exception as e:
+                    logger.exception(f"[{cfg.name}] Gemini failed")
+                    try:
+                        tele.send_text(f"⚠️[{cfg.name}] Gemini failed: {e}")
+                    except Exception:
+                        pass
+
+        # Gửi video (nếu bật)
+        if cfg.send_video:
+            try:
+                tele.send_video(clip_full, caption=f"{cfg.name} event clip")
+                logger.info(f"[{cfg.name}] Telegram video sent")
+            except Exception as e:
+                logger.exception(f"[{cfg.name}] Telegram video failed")
+                try:
+                    tele.send_text(f"⚠️[{cfg.name}] Telegram video failed: {e}")
+                except Exception:
+                    pass
+
+    def _flush_loop():
+        while not stop_flush.is_set():
+            try:
+                emitted = merger.flush_due(time.time())
+                if emitted is not None:
+                    process_emitted(emitted)
+            except Exception as e:
+                logger.warning(f"[{cfg.name}] Flush loop error: {e}")
+            finally:
+                stop_flush.wait(FLUSH_TICK_SEC)
+
+    flush_thread = threading.Thread(target=_flush_loop, daemon=True)
+    flush_thread.start()
+    logger.info(f"[{cfg.name}] Idle-flush enabled: tick={FLUSH_TICK_SEC}s")
 
     try:
         for det in detector.stream_detect(src_ai, motion_gate=motion):
@@ -262,115 +386,15 @@ def run():
             if len(dq) < CONFIRM_FRAMES:
                 continue
 
-            # Gom event
+            # Gộp event (đóng khi im lặng): có thể chưa trả ngay
             emitted = merger.push(cls, ts)
             if emitted is None:
                 emitted = merger.flush_due(ts)
                 if emitted is None:
                     continue
 
-            t_first, t_last, ev = emitted
-            dur = max(0.0, t_last - t_first)
-            logger.info(f"[{cfg.name}] EVENT {ev.cls} x{ev.count} window={dur:.1f}s")
-
-            # Bỏ qua event quá ngắn
-            if dur < MIN_EVENT_SECONDS:
-                logger.info(f"[{cfg.name}] skip short event (<{MIN_EVENT_SECONDS}s)")
-                next_armed_ts = time.time() + min(POST_EVENT_SILENCE_SEC, 2.0)
-                continue
-
-            # Đặt blackout ngay khi chấp nhận event
-            next_armed_ts = time.time() + POST_EVENT_SILENCE_SEC
-
-            # Cửa sổ clip trên MAIN
-            t0 = max(0.0, t_first - cfg.pre_roll)
-            t1_req = t_last + cfg.post_roll
-            now_ts = time.time()
-            t1 = min(t1_req, now_ts - CLIP_SAFETY_LAG)
-            if t1 <= t0:
-                logger.info(f"[{cfg.name}] clip window empty after clamp: t0={t0:.2f}, t1={t1:.2f}, now={now_ts:.2f}")
-                continue
-
-            clip_full = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}.mp4")
-
-            # Cắt clip (copy stream, rất nhanh)
-            t_clip = time.perf_counter()
-            try:
-                logger.info(f"[{cfg.name}] clip_window=[{t0:.2f},{t1:.2f}] (req_end={t1_req:.2f}, now={now_ts:.2f})")
-                rb.make_clip(t0, t1, clip_full)
-                logger.info(f"[{cfg.name}] Clip OK → {clip_full}")
-            except Exception as e:
-                logger.exception(f"[{cfg.name}] Clip failed")
-                try:
-                    tele.send_text(f"❗️[{cfg.name}] Clip failed: {e}")
-                except Exception:
-                    pass
-                continue
-            logger.info(f"[{cfg.name}] T_clip={(time.perf_counter()-t_clip):.2f}s")
-
-            # Gửi NGAY text (nếu bật)
-            if SEND_IMMEDIATE:
-                prelim = f"Sự kiện: {ev.cls} x{ev.count} ({dur:.1f}s) — đang phân tích…"
-                try:
-                    tele.send_text(f"🔔 [{cfg.name}] {prelim}")
-                except Exception:
-                    pass
-                # (Bạn đang dùng TTS cho summary, nên mặc định TTS_ON_IMMEDIATE=no)
-
-            # Nén nhẹ cho Gemini (ultrafast)
-            clip_lite = str(Path(cfg.clip_dir) / f"{cfg.name}_event_{int(t_first)}_720p.mp4")
-            t_comp = time.perf_counter()
-            try:
-                make_gemini_lite(clip_full, clip_lite, scale_short_side=720, crf=30)
-                logger.info(f"[{cfg.name}] Compress OK → {clip_lite}")
-            except Exception as e:
-                logger.warning(f"[{cfg.name}] Compress failed → dùng full. err={e}")
-                try:
-                    tele.send_text(f"⚠️[{cfg.name}] Compress failed: {e}")
-                except Exception:
-                    pass
-                clip_lite = clip_full
-            logger.info(f"[{cfg.name}] T_compress={(time.perf_counter()-t_comp):.2f}s")
-
-            # Gemini (async/sync) + (tuỳ chọn) voice summary
-            if GEMINI_ENABLE:
-                if GEMINI_ASYNC:
-                    _spawn_gemini_worker(
-                        gem, tele, cfg.name, clip_lite, logger,
-                        skip_no_activity=SKIP_NO_ACTIVITY,
-                        tts=tts, tts_on_summary=TTS_ON_SUMMARY, clip_dir=cfg.clip_dir
-                    )
-                else:
-                    t2 = time.perf_counter()
-                    try:
-                        summary = gem.analyze_video(clip_lite)
-                        logger.info(f"[{cfg.name}] T_gemini={(time.perf_counter()-t2):.2f}s")
-                        if SKIP_NO_ACTIVITY and summary.strip().upper() == "NO_ACTIVITY":
-                            logger.info(f"[{cfg.name}] Gemini: NO_ACTIVITY → skip notify")
-                        else:
-                            msg = f"🎥 [{cfg.name}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}"
-                            tele.send_text(msg)
-                            if tts and TTS_ON_SUMMARY:
-                                _spawn_tts_voice(tts, tele, cfg.name, summary, cfg.clip_dir, logger)
-                            logger.info(f"[{cfg.name}] Gemini summary sent")
-                    except Exception as e:
-                        logger.exception(f"[{cfg.name}] Gemini failed")
-                        try:
-                            tele.send_text(f"⚠️[{cfg.name}] Gemini failed: {e}")
-                        except Exception:
-                            pass
-
-            # Gửi video (nếu bật)
-            if cfg.send_video:
-                try:
-                    tele.send_video(clip_full, caption=f"{cfg.name} event clip")
-                    logger.info(f"[{cfg.name}] Telegram video sent")
-                except Exception as e:
-                    logger.exception(f"[{cfg.name}] Telegram video failed")
-                    try:
-                        tele.send_text(f"⚠️[{cfg.name}] Telegram video failed: {e}")
-                    except Exception:
-                        pass
+            # Nếu đủ điều kiện đóng ngay (ví dụ bạn vừa rời khung > idle_end)
+            process_emitted(emitted)
 
     except KeyboardInterrupt:
         pass
@@ -380,6 +404,12 @@ def run():
             stop_wd.set()
             if wd_thread:
                 wd_thread.join(timeout=2)
+        except Exception:
+            pass
+        # dừng idle-flush
+        try:
+            stop_flush.set()
+            flush_thread.join(timeout=2)
         except Exception:
             pass
 
